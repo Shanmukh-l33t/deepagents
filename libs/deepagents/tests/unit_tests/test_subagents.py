@@ -34,6 +34,7 @@ from langsmith.run_helpers import tracing_context
 from pydantic import BaseModel, Field, ValidationError
 
 from deepagents.backends.filesystem import FilesystemBackend
+from deepagents.backends.utils import create_file_data
 from deepagents.graph import create_deep_agent
 from deepagents.middleware.rubric import RubricState
 from deepagents.middleware.skills import SkillMetadata, SkillsMiddleware
@@ -360,6 +361,98 @@ class TestSubAgents:
         assert multiplication_tool_message.content == "The product of 4 and 6 is 24.", (
             f"Multiplication subagent should return exact message, got: {multiplication_tool_message.content}"
         )
+
+    @staticmethod
+    def _file_subagent(name: str, tool_name: str, file_path: str, content: str = "") -> SubAgent:
+        """Build a declarative subagent whose first model call is one `file_path` tool call."""
+        args = {"file_path": file_path}
+        if tool_name == "write_file":
+            args["content"] = content
+        return SubAgent(
+            name=name,
+            description=name,
+            model=_ScriptedChatModel(
+                responses=[
+                    AIMessage(
+                        content="",
+                        tool_calls=[{"name": tool_name, "args": args, "id": f"{tool_name}_{name}", "type": "tool_call"}],
+                    ),
+                    AIMessage(content="Updated"),
+                ]
+            ),
+            system_prompt="Update the release document.",
+        )
+
+    def test_parallel_subagents_keep_their_own_file_edits(self) -> None:
+        """Both parallel subagents' edits survive in the parent's `files`.
+
+        Each subagent returns its whole `files` snapshot. Merging a snapshot as a
+        partial update let the second subagent's stale copy of the first file win.
+        """
+        paths = ["/CHANGELOG.md", "/docs/install.md"]
+        subagents = [
+            self._file_subagent("changelog", "write_file", paths[0], "Release 1.5: CSV export"),
+            self._file_subagent("installation", "write_file", paths[1], "pip install example-cli==1.5"),
+        ]
+        parent = _ScriptedChatModel(
+            responses=[
+                AIMessage(
+                    content="",
+                    tool_calls=[
+                        {"name": "task", "args": {"description": f"Update {path}", "subagent_type": name}, "id": name, "type": "tool_call"}
+                        for name, path in zip(["changelog", "installation"], paths, strict=True)
+                    ],
+                ),
+                AIMessage(content="Done"),
+            ]
+        )
+        agent = create_deep_agent(model=parent, subagents=subagents)
+
+        result = agent.invoke(
+            {
+                "messages": [HumanMessage(content="Prepare the 1.5 release docs.")],
+                "files": {
+                    paths[0]: create_file_data("Release 1.4"),
+                    paths[1]: create_file_data("pip install example-cli==1.4"),
+                },
+            }
+        )
+
+        contents = {path: data["content"] for path, data in result["files"].items()}
+        assert contents == {
+            paths[0]: "Release 1.5: CSV export",
+            paths[1]: "pip install example-cli==1.5",
+        }
+
+    def test_subagent_file_deletion_reaches_parent_files(self) -> None:
+        """A subagent's successful `delete` removes the file from the parent's `files`."""
+        subagent = self._file_subagent("cleanup", "delete", "/obsolete.txt")
+        parent = _ScriptedChatModel(
+            responses=[
+                AIMessage(
+                    content="",
+                    tool_calls=[
+                        {
+                            "name": "task",
+                            "args": {"description": "Remove it", "subagent_type": "cleanup"},
+                            "id": "task_cleanup",
+                            "type": "tool_call",
+                        }
+                    ],
+                ),
+                AIMessage(content="Done"),
+            ]
+        )
+        agent = create_deep_agent(model=parent, subagents=[subagent])
+
+        result = agent.invoke(
+            {
+                "messages": [HumanMessage(content="Remove the obsolete file.")],
+                "files": {"/obsolete.txt": create_file_data("obsolete"), "/kept.txt": create_file_data("kept")},
+            }
+        )
+
+        assert {path: data["content"] for path, data in result["files"].items()} == {"/kept.txt": "kept"}
 
     @staticmethod
     def _build_parallel_rubric_agent(*, change_child_rubric: bool, mode: str) -> tuple[Any, list[str | None]]:

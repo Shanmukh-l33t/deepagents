@@ -32,7 +32,7 @@ from langsmith.run_helpers import get_tracing_context, tracing_context
 from pydantic import BaseModel, Field, ValidationError, model_validator
 from typing_extensions import TypeIs
 
-from deepagents.backends.protocol import BackendProtocol
+from deepagents.backends.protocol import BackendProtocol, FileData
 from deepagents.middleware._skill_tools import _SKILL_TOOLS_DISCLOSED_KEY
 from deepagents.middleware._utils import append_to_system_message
 from deepagents.middleware.filesystem import FilesystemMiddleware, FilesystemPermission
@@ -491,6 +491,23 @@ def _is_unchanged(key: str, value: object, inputs: dict) -> bool:
     return value is inputs[key] or (value == inputs[key]) is True
 
 
+def _apply_files_snapshot(state_update: dict, inputs: dict, result: dict) -> None:
+    """Replace a declarative subagent's whole `files` snapshot with only the paths it changed.
+
+    The snapshot carries stale copies of files another parallel `task` call just
+    wrote, so merging it whole would let those win. A path missing from the
+    snapshot is a deletion, which the `files` reducer applies as a `None` marker.
+    """
+    before: dict[str, FileData] = inputs.get("files") or {}
+    after: dict[str, FileData] = result.get("files") or {}
+    changes: dict[str, FileData | None] = {path: data for path, data in after.items() if before.get(path) != data}
+    changes.update(dict.fromkeys(before.keys() - after.keys()))
+    if changes:
+        state_update["files"] = changes
+    else:
+        state_update.pop("files", None)
+
+
 _TASK_TOOL_INJECTED_ARGS = frozenset({"runtime"})
 """Arguments the tool node injects into the `task` call alongside the model's."""
 
@@ -833,7 +850,14 @@ def _build_task_tool(  # noqa: C901, PLR0915
     # mirror tool (above) can reference these directly -- everything they
     # call is only looked up when actually invoked, long after this
     # function returns, so those don't need to exist yet.
-    def _return_command_with_state_update(result: dict, tool_call_id: str, inputs: dict, *, checkpoint_ns: str | None) -> Command:
+    def _return_command_with_state_update(
+        result: dict,
+        tool_call_id: str,
+        inputs: dict,
+        *,
+        checkpoint_ns: str | None,
+        files_snapshot: bool,
+    ) -> Command:
         # Validate that the result contains a 'messages' key
         if "messages" not in result:
             error_msg = (
@@ -846,6 +870,11 @@ def _build_task_tool(  # noqa: C901, PLR0915
         state_update = {
             k: v for k, v in result.items() if k not in _EXCLUDED_STATE_KEYS and k not in private_state_keys and not _is_unchanged(k, v, inputs)
         }
+
+        # A declarative subagent returns a snapshot; a compiled runnable may return a partial
+        # `files` update, which keeps the value it returned.
+        if files_snapshot:
+            _apply_files_snapshot(state_update, inputs, result)
 
         structured = result.get("structured_response")
         if structured is not None:
@@ -969,7 +998,10 @@ def _build_task_tool(  # noqa: C901, PLR0915
             if (notice := _refusal_notice_for(error)) is None:
                 raise
             return notice
-        return _return_command_with_state_update(result, runtime.tool_call_id, subagent_state, checkpoint_ns=checkpoint_ns)
+        files_snapshot = not _is_compiled_subagent(subagents_by_name[subagent_type])
+        return _return_command_with_state_update(
+            result, runtime.tool_call_id, subagent_state, checkpoint_ns=checkpoint_ns, files_snapshot=files_snapshot
+        )
 
     async def atask(
         description: str,
@@ -1010,7 +1042,10 @@ def _build_task_tool(  # noqa: C901, PLR0915
             if (notice := _refusal_notice_for(error)) is None:
                 raise
             return notice
-        return _return_command_with_state_update(result, runtime.tool_call_id, subagent_state, checkpoint_ns=checkpoint_ns)
+        files_snapshot = not _is_compiled_subagent(subagents_by_name[subagent_type])
+        return _return_command_with_state_update(
+            result, runtime.tool_call_id, subagent_state, checkpoint_ns=checkpoint_ns, files_snapshot=files_snapshot
+        )
 
     compiled_subagents = [_compile_spec(spec) for spec in subagents]
     subagents_by_name = {spec["name"]: spec for spec in subagents}
