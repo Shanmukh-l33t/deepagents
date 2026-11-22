@@ -1015,6 +1015,40 @@ class TestOffloadingBasic:
         expected_section_count = 2  # One existing + one new summarization section
         assert new_string.count("## Summarized at") == expected_section_count
 
+    async def test_offload_skips_empty_section_for_previous_summary_only(self) -> None:
+        """A previous summary alone leaves the history file untouched (issue #7834)."""
+        existing = '## Summarized at 2024-01-01T00:00:00Z\n\n<message type="human">old</message>\n\n'
+        previous_summary = HumanMessage(
+            content="Here is a summary of the conversation to date:\n\nPrevious summary content...",
+            additional_kwargs={"lc_source": "summarization"},
+            id="summary-msg-0",
+        )
+        middleware = SummarizationMiddleware(
+            model=make_mock_model(),
+            backend=MockBackend(),
+            trigger=("messages", 5),
+            keep=("messages", 2),
+        )
+
+        backend = MockBackend(existing_content=existing)
+        path = middleware._offload_to_backend(backend, [previous_summary], "session_abc")
+        assert path == "/conversation_history/session_abc.md"
+        assert backend.write_calls == []
+        assert backend.edit_calls == []
+
+        empty_backend = MockBackend()
+        assert middleware._offload_to_backend(empty_backend, [previous_summary], "session_abc") is None
+        assert empty_backend.write_calls == []
+
+        async_backend = MockBackend(existing_content=existing)
+        assert await middleware._aoffload_to_backend(async_backend, [previous_summary], "session_abc") == path
+        assert async_backend.write_calls == []
+        assert async_backend.edit_calls == []
+
+        empty_async_backend = MockBackend()
+        assert await middleware._aoffload_to_backend(empty_async_backend, [previous_summary], "session_abc") is None
+        assert empty_async_backend.write_calls == []
+
     def test_typical_tool_heavy_conversation(self) -> None:
         """Test with a realistic tool-heavy conversation pattern.
 

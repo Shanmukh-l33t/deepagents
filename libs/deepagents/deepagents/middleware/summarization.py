@@ -1377,10 +1377,12 @@ A condensed summary follows:
         """Persist messages to backend before summarization.
 
         Appends evicted messages to a single markdown file per session. Each
-        summarization event adds a new section with a timestamp header.
+        summarization event that contributes new messages adds a new section
+        with a timestamp header.
 
         Previous summary messages are filtered out to avoid redundant storage during
-        chained summarization events.
+        chained summarization events. When nothing remains after filtering, no
+        section is written and any existing history file is reused.
 
         A `None` return is non-fatal; callers may proceed without the
         offloaded history.
@@ -1391,7 +1393,8 @@ A condensed summary follows:
             session_id: Id naming the history file.
 
         Returns:
-            The file path where history was offloaded, or `None` on failure.
+            The file path where history was offloaded, or `None` on failure or
+                when there is nothing new to offload and no history file exists.
         """
         path = self._get_history_path(session_id)
 
@@ -1418,6 +1421,10 @@ A condensed summary follows:
                 type(e).__name__,
                 e,
             )
+
+        if not filtered_messages:
+            # Only previous summaries were evicted; the existing file already holds them.
+            return path if existing_content else None
 
         combined_content = existing_content + new_section
 
@@ -1454,10 +1461,12 @@ A condensed summary follows:
         """Persist messages to backend before summarization (async).
 
         Appends evicted messages to a single markdown file per session. Each
-        summarization event adds a new section with a timestamp header.
+        summarization event that contributes new messages adds a new section
+        with a timestamp header.
 
         Previous summary messages are filtered out to avoid redundant storage during
-        chained summarization events.
+        chained summarization events. When nothing remains after filtering, no
+        section is written and any existing history file is reused.
 
         A `None` return is non-fatal; callers may proceed without the
         offloaded history.
@@ -1468,7 +1477,8 @@ A condensed summary follows:
             session_id: Id naming the history file.
 
         Returns:
-            The file path where history was offloaded, or `None` on failure.
+            The file path where history was offloaded, or `None` on failure or
+                when there is nothing new to offload and no history file exists.
         """
         path = self._get_history_path(session_id)
 
@@ -1495,6 +1505,10 @@ A condensed summary follows:
                 type(e).__name__,
                 e,
             )
+
+        if not filtered_messages:
+            # Only previous summaries were evicted; the existing file already holds them.
+            return path if existing_content else None
 
         combined_content = existing_content + new_section
 
